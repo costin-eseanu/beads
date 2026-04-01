@@ -230,6 +230,11 @@ type Config struct {
 	// creation of shadow databases on the wrong server.
 	CreateIfMissing bool
 
+	// ServerMode indicates this config targets an external dolt sql-server
+	// rather than the embedded Dolt engine. Set by the store factory based
+	// on metadata.json dolt_mode or BEADS_DOLT_SERVER_MODE env var.
+	ServerMode bool
+
 	// AutoStart enables transparent server auto-start when connection fails.
 	// When true and the host is localhost, bd will start a dolt sql-server
 	// automatically if one isn't running. Disabled under orchestrator (GT_ROOT set).
@@ -405,7 +410,7 @@ func init() {
 		metric.WithUnit("{retry}"),
 	)
 	doltMetrics.lockWaitMs, _ = m.Float64Histogram("bd.db.lock_wait_ms",
-		metric.WithDescription("Time spent waiting to acquire the dolt access lock"),
+		metric.WithDescription("Time spent waiting to acquire database locks"),
 		metric.WithUnit("ms"),
 	)
 	doltMetrics.circuitTrips, _ = m.Int64Counter("bd.db.circuit_trips",
@@ -566,14 +571,50 @@ func (s *DoltStore) BackupRemove(ctx context.Context, name string) error {
 	return versioncontrolops.BackupRemove(ctx, s.db, name)
 }
 
-// BackupExportTables exports all tables to JSONL files in dir.
-func (s *DoltStore) BackupExportTables(ctx context.Context, dir, prefix string) (*storage.BackupCounts, error) {
-	return versioncontrolops.ExportTables(ctx, s.db, dir, prefix)
+// BackupDatabase registers dir as a file:// Dolt backup remote and syncs
+// the full database to it, preserving complete commit history.
+func (s *DoltStore) BackupDatabase(ctx context.Context, dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("backup destination does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("backup destination is not a directory: %s", dir)
+	}
+
+	backupURL, err := versioncontrolops.DirToFileURL(dir)
+	if err != nil {
+		return err
+	}
+	backupName := "backup_export"
+
+	// Register as a backup remote (idempotent — remove first if exists).
+	_ = versioncontrolops.BackupRemove(ctx, s.db, backupName)
+	if err := versioncontrolops.BackupAdd(ctx, s.db, backupName, backupURL); err != nil {
+		return fmt.Errorf("register backup remote: %w", err)
+	}
+	if err := versioncontrolops.BackupSync(ctx, s.db, backupName); err != nil {
+		return fmt.Errorf("sync to backup: %w", err)
+	}
+	return nil
 }
 
-// BackupRestoreFromDir restores all JSONL tables from dir.
-func (s *DoltStore) BackupRestoreFromDir(ctx context.Context, dir, prefix string, dryRun bool) (*storage.BackupRestoreResult, error) {
-	return versioncontrolops.RestoreFromDir(ctx, s.db, s, dir, prefix, dryRun)
+// RestoreDatabase restores the database from a Dolt backup at dir.
+// When force is true, an existing database is overwritten.
+func (s *DoltStore) RestoreDatabase(ctx context.Context, dir string, force bool) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("backup source does not exist: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("backup source is not a directory: %s", dir)
+	}
+
+	backupURL, err := versioncontrolops.DirToFileURL(dir)
+	if err != nil {
+		return err
+	}
+	return versioncontrolops.BackupRestore(ctx, s.db, backupURL, s.database, force)
 }
 
 // QueryContext wraps s.db.QueryContext with retry for transient errors.
@@ -1404,37 +1445,12 @@ func (s *DoltStore) Close() error {
 		s.autoStartedServerDir = ""
 	}
 
-	// Clean up 0-byte noms LOCK files. The Dolt engine creates these when
-	// opening a database; they should be removed on clean shutdown but may
-	// persist after crashes or when bd init triggers hook reopens.
-	if s.dbPath != "" {
-		cleanZeroByteNomsLocks(s.dbPath)
-	}
+	// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+	// directory — including noms/LOCK files. These are Dolt-internal files.
+	// Removing them WILL cause unrecoverable data corruption and data loss.
+	// Dolt manages these files itself; external interference is never safe.
 
 	return err
-}
-
-// cleanZeroByteNomsLocks removes 0-byte noms LOCK files from all databases
-// under doltDir. Only empty LOCK files are removed — non-empty ones may
-// indicate an active lock held by a running server.
-func cleanZeroByteNomsLocks(doltDir string) {
-	entries, err := os.ReadDir(doltDir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		lockPath := filepath.Join(doltDir, entry.Name(), ".dolt", "noms", "LOCK")
-		info, statErr := os.Stat(lockPath)
-		if statErr != nil {
-			continue
-		}
-		if info.Size() == 0 {
-			_ = os.Remove(lockPath)
-		}
-	}
 }
 
 // Path returns the database directory path

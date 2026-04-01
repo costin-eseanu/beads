@@ -151,7 +151,7 @@ Examples:
 		if err != nil {
 			// Connection may have gone stale while the editor was open.
 			// Ping to force the pool to discard dead connections, then retry.
-			if accessor, ok := issueStore.(storage.RawDBAccessor); ok {
+			if accessor, ok := storage.UnwrapStore(issueStore).(storage.RawDBAccessor); ok {
 				if pingErr := accessor.DB().PingContext(ctx); pingErr != nil {
 					// Ping failed — try to force a fresh connection via sql.DB pool reset.
 					accessor.DB().SetConnMaxIdleTime(0)
@@ -166,9 +166,9 @@ Examples:
 		}
 		editSaved = true
 
-		// Embedded mode: flush Dolt commit (only for non-routed stores).
-		if isEmbeddedDolt && !result.Routed {
-			if _, err := issueStore.CommitPending(ctx, actor); err != nil {
+		// Embedded mode: flush Dolt commit.
+		if isEmbeddedMode() {
+			if _, err := store.CommitPending(ctx, actor); err != nil {
 				FatalErrorRespectJSON("failed to commit: %v", err)
 			}
 		}

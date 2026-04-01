@@ -31,13 +31,32 @@ var adoWorkItemPattern = regexp.MustCompile(`/_workitems/edit/(\d+)`)
 // under the name "ado" and supports bidirectional sync of work items between
 // ADO and the local beads database.
 type Tracker struct {
-	client  *Client
-	store   storage.Storage
-	mapper  tracker.FieldMapper
-	baseURL string // Resolved base URL for external ref matching
-	org     string
-	project string
-	filters *PullFilters // Optional pull filters for WIQL queries
+	client   *Client
+	store    storage.Storage
+	mapper   tracker.FieldMapper
+	baseURL  string // Resolved base URL for external ref matching
+	org      string
+	projects []string     // one or more project names (first is primary)
+	filters  *PullFilters // Optional pull filters for WIQL queries
+}
+
+// SetProjects sets project names before Init(). When set, Init() uses these
+// instead of reading from config. This supports the --project CLI flag.
+func (t *Tracker) SetProjects(projects []string) {
+	t.projects = projects
+}
+
+// Projects returns the list of configured project names.
+func (t *Tracker) Projects() []string {
+	return t.projects
+}
+
+// PrimaryProject returns the first configured project name.
+func (t *Tracker) PrimaryProject() string {
+	if len(t.projects) == 0 {
+		return ""
+	}
+	return t.projects[0]
 }
 
 // Name returns the lowercase identifier for this tracker.
@@ -60,14 +79,20 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 	}
 
 	t.org = t.getConfig(ctx, "ado.org", "AZURE_DEVOPS_ORG")
-	t.project = t.getConfig(ctx, "ado.project", "AZURE_DEVOPS_PROJECT")
 	customURL := t.getConfig(ctx, "ado.url", "AZURE_DEVOPS_URL")
 
 	if t.org == "" && customURL == "" {
 		return fmt.Errorf("Azure DevOps organization not configured (set ado.org or AZURE_DEVOPS_ORG)")
 	}
-	if t.project == "" {
-		return fmt.Errorf("Azure DevOps project not configured (set ado.project or AZURE_DEVOPS_PROJECT)")
+
+	// Resolve projects: use pre-set projects (from CLI), or fall back to config.
+	if len(t.projects) == 0 {
+		pluralVal := t.getConfig(ctx, "ado.projects", "AZURE_DEVOPS_PROJECTS")
+		singularVal := t.getConfig(ctx, "ado.project", "AZURE_DEVOPS_PROJECT")
+		t.projects = tracker.ResolveProjectIDs(nil, pluralVal, singularVal)
+	}
+	if len(t.projects) == 0 {
+		return fmt.Errorf("Azure DevOps project not configured (set ado.project, ado.projects, or AZURE_DEVOPS_PROJECT)")
 	}
 
 	if t.org != "" {
@@ -75,8 +100,10 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 			return fmt.Errorf("invalid Azure DevOps organization: %w", err)
 		}
 	}
-	if err := ValidateProject(t.project); err != nil {
-		return fmt.Errorf("invalid Azure DevOps project: %w", err)
+	for _, p := range t.projects {
+		if err := ValidateProject(p); err != nil {
+			return fmt.Errorf("invalid Azure DevOps project %q: %w", p, err)
+		}
 	}
 
 	// Read custom state/type mappings from config.
@@ -86,7 +113,8 @@ func (t *Tracker) Init(ctx context.Context, store storage.Storage) error {
 
 	t.mapper = NewFieldMapper(stateMap, typeMap)
 
-	t.client = NewClient(NewSecretString(pat), t.org, t.project)
+	// Create client with primary project for API URL construction.
+	t.client = NewClient(NewSecretString(pat), t.org, t.PrimaryProject())
 	if customURL != "" {
 		var err error
 		t.client, err = t.client.WithBaseURL(customURL)
@@ -134,9 +162,9 @@ func (t *Tracker) FetchIssues(ctx context.Context, opts tracker.FetchOptions) ([
 	var err error
 
 	if opts.Since != nil {
-		items, err = t.client.FetchWorkItemsSince(ctx, *opts.Since, t.filters)
+		items, err = t.client.FetchWorkItemsSinceMulti(ctx, *opts.Since, t.projects, t.filters)
 	} else {
-		items, err = t.client.FetchAllWorkItems(ctx, t.filters)
+		items, err = t.client.FetchAllWorkItemsMulti(ctx, t.projects, t.filters)
 	}
 	if err != nil {
 		return nil, err
@@ -172,7 +200,10 @@ func (t *Tracker) FetchIssue(ctx context.Context, identifier string) (*tracker.T
 	return &ti, nil
 }
 
-// CreateIssue creates a new work item in Azure DevOps.
+// CreateIssue creates a new work item in Azure DevOps. If the target state
+// is not a valid initial state (e.g., "Closed"), the work item is created
+// without a state (ADO assigns its default) and then transitioned through
+// intermediate states to reach the target.
 func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker.TrackerIssue, error) {
 	fields := t.mapper.IssueToTracker(issue)
 	typeName, _ := t.mapper.TypeToTracker(issue.IssueType).(string)
@@ -180,9 +211,36 @@ func (t *Tracker) CreateIssue(ctx context.Context, issue *types.Issue) (*tracker
 		typeName = "Task"
 	}
 
+	// Extract and remove the target state from creation fields when it is not
+	// a valid initial state. ADO rejects creating items directly in states
+	// like "Closed" — they must be created in an initial state and transitioned.
+	var targetState string
+	if s, ok := fields[FieldState].(string); ok && !isInitialState(s) {
+		targetState = s
+		delete(fields, FieldState)
+	}
+
 	wi, err := t.client.CreateWorkItem(ctx, typeName, fields)
 	if err != nil {
 		return nil, err
+	}
+
+	// Transition to the target state if it differs from the created state.
+	if targetState != "" {
+		createdState := wi.GetStringField(FieldState)
+		if createdState != targetState {
+			transitioned, err := t.client.transitionWorkItem(ctx, wi.ID, typeName, createdState, targetState)
+			if err != nil {
+				// Return the created item even if transition fails — the item
+				// exists in ADO but may be in the wrong state.
+				ti := adoWorkItemToTrackerIssue(wi)
+				return &ti, fmt.Errorf("created work item %d but failed to transition from %q to %q: %w",
+					wi.ID, createdState, targetState, err)
+			}
+			if transitioned != nil {
+				wi = transitioned
+			}
+		}
 	}
 
 	ti := adoWorkItemToTrackerIssue(wi)
@@ -242,13 +300,14 @@ func (t *Tracker) BuildExternalRef(issue *tracker.TrackerIssue) string {
 	if issue.URL != "" {
 		return issue.URL
 	}
-	if t.org != "" && t.project != "" {
+	project := t.PrimaryProject()
+	if t.org != "" && project != "" {
 		return fmt.Sprintf("%s/%s/%s/_workitems/edit/%s",
-			DefaultBaseURL, url.PathEscape(t.org), url.PathEscape(t.project), issue.Identifier)
+			DefaultBaseURL, url.PathEscape(t.org), url.PathEscape(project), issue.Identifier)
 	}
-	if t.baseURL != "" && t.project != "" {
+	if t.baseURL != "" && project != "" {
 		return fmt.Sprintf("%s/%s/_workitems/edit/%s",
-			t.baseURL, url.PathEscape(t.project), issue.Identifier)
+			t.baseURL, url.PathEscape(project), issue.Identifier)
 	}
 	return fmt.Sprintf("ado:%s", issue.Identifier)
 }

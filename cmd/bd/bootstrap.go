@@ -49,6 +49,30 @@ Examples:
 		// Find beads directory
 		beadsDir := beads.FindBeadsDir()
 		if beadsDir == "" {
+			// No .beads directory exists yet. Before giving up, probe the
+			// git remote for existing Beads data (refs/dolt/data). This is
+			// the "fresh second clone" case: clone1 pushed Beads state to
+			// origin, and clone2 needs to bootstrap from it. (GH#2792)
+			//
+			// If found, synthesize the theoretical .beads path and fall
+			// through to the normal detectBootstrapAction + executeBootstrapPlan
+			// flow. Actual directory creation is deferred to executeSyncAction
+			// to preserve --dry-run semantics.
+			if isGitRepo() && !isBareGitRepo() {
+				if originURL, err := gitRemoteGetURL("origin"); err == nil && originURL != "" {
+					if gitLsRemoteHasRef("origin", "refs/dolt/data") {
+						cwd, err := os.Getwd()
+						if err != nil {
+							FatalError("failed to get working directory: %v", err)
+						}
+						beadsDir = filepath.Join(cwd, ".beads")
+					}
+				}
+			}
+		}
+
+		if beadsDir == "" {
+			// No .beads and no remote data — nothing to bootstrap from.
 			if jsonOutput {
 				outputJSON(map[string]interface{}{
 					"action":     "none",
@@ -86,8 +110,7 @@ Examples:
 
 		// Execute the plan
 		if err := executeBootstrapPlan(plan, cfg); err != nil {
-			fmt.Fprintf(os.Stderr, "Bootstrap failed: %v\n", err)
-			os.Exit(1)
+			FatalError("Bootstrap failed: %v", err)
 		}
 	},
 }
@@ -112,7 +135,7 @@ func detectBootstrapAction(beadsDir string, cfg *configfile.Config) BootstrapPla
 
 	// Check for existing database (path differs between server and embedded mode)
 	var dbPath string
-	if isEmbeddedDolt {
+	if isEmbeddedMode() {
 		dbPath = filepath.Join(beadsDir, "embeddeddolt")
 	} else {
 		dbPath = doltserver.ResolveDoltDir(beadsDir)
@@ -177,7 +200,7 @@ func printBootstrapPlan(plan BootstrapPlan) {
 	switch plan.Action {
 	case "none":
 		fmt.Printf("✓ Database already exists: %s\n", plan.BeadsDir)
-		if isEmbeddedDolt {
+		if isEmbeddedMode() {
 			fmt.Printf("  Nothing to do.\n")
 		} else {
 			fmt.Printf("  Nothing to do. Use 'bd doctor' to check health.\n")
@@ -283,13 +306,11 @@ func executeRestoreAction(ctx context.Context, plan BootstrapPlan, cfg *configfi
 		return fmt.Errorf("commit init: %w", err)
 	}
 
-	result, err := runBackupRestore(ctx, s, plan.BackupDir, false)
-	if err != nil {
+	if err := runBackupRestore(ctx, s, plan.BackupDir, false); err != nil {
 		return fmt.Errorf("restore from backup: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Restored from backup: %d issues, %d comments, %d dependencies, %d labels\n",
-		result.Issues, result.Comments, result.Dependencies, result.Labels)
+	fmt.Fprintf(os.Stderr, "Restored from backup\n")
 	return nil
 }
 
@@ -330,9 +351,16 @@ func executeJSONLImportAction(ctx context.Context, plan BootstrapPlan, cfg *conf
 }
 
 func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.Config) error {
+	// Ensure .beads directory exists — it may not in the "fresh clone"
+	// bootstrap path where we detected remote data before .beads was
+	// created. Deferred here to preserve --dry-run semantics. (GH#2792)
+	if err := os.MkdirAll(plan.BeadsDir, 0o750); err != nil {
+		return fmt.Errorf("create beads directory: %w", err)
+	}
+
 	dbName := cfg.GetDoltDatabase()
 
-	if isEmbeddedDolt {
+	if isEmbeddedMode() {
 		// Embedded mode: open a connection to the embedded engine and use
 		// DOLT_CLONE to create the database from the remote URL.
 		dataDir := filepath.Join(plan.BeadsDir, "embeddeddolt")
@@ -351,6 +379,11 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 			return fmt.Errorf("clone from remote: %w", err)
 		}
 
+		// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+		// directory — including noms/LOCK files. These are Dolt-internal files.
+		// Removing them WILL cause unrecoverable data corruption and data loss.
+		// Dolt manages these files itself; external interference is never safe.
+
 		fmt.Fprintf(os.Stderr, "Synced database from %s\n", plan.SyncRemote)
 		return nil
 	}
@@ -361,6 +394,10 @@ func executeSyncAction(ctx context.Context, plan BootstrapPlan, cfg *configfile.
 		return fmt.Errorf("sync from remote: %w", err)
 	}
 	if synced {
+		// WARNING: DO NOT remove, delete, or modify files inside Dolt's .dolt/
+		// directory — including noms/LOCK files. These are Dolt-internal files.
+		// Removing them WILL cause unrecoverable data corruption and data loss.
+		// Dolt manages these files itself; external interference is never safe.
 		fmt.Fprintf(os.Stderr, "Synced database from %s\n", plan.SyncRemote)
 	}
 	return nil

@@ -123,7 +123,7 @@ Examples:
 					results = append(results, phaseResult{name: "Decay", detail: fmt.Sprintf("%d issues deleted", deleted)})
 
 					// Embedded mode: flush Dolt commit after deletes.
-					if isEmbeddedDolt && deleted > 0 && store != nil {
+					if isEmbeddedMode() && deleted > 0 && store != nil {
 						if _, err := store.CommitPending(ctx, actor); err != nil {
 							WarnError("failed to commit after decay: %v", err)
 						}
@@ -176,7 +176,7 @@ Examples:
 				fmt.Println("Phase 3/3: Dolt GC (reclaim disk space)")
 			}
 
-			gc, ok := store.(storage.GarbageCollector)
+			gc, ok := storage.UnwrapStore(store).(storage.GarbageCollector)
 			if !ok {
 				if !jsonOutput {
 					fmt.Println("  Storage backend does not support GC, skipping")
